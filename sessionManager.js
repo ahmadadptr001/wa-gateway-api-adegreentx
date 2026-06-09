@@ -3,27 +3,20 @@ import path from "path";
 
 const SESSION_FILE = path.join(process.cwd(), "session_data.json");
 
-/**
- * Simpan metadata session ke file
- */
-export function saveSession(phoneNumber, otpCodeManual) {
+export function saveSession(phoneNumber, otpCodeManual = null) {
   const data = {
     phone: phoneNumber,
-    otp: otpCodeManual,
     savedAt: new Date().toISOString(),
   };
   fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
-  console.log("[SESSION] Metadata saved!");
+  console.log("[SESSION] Metadata saved for phone:", phoneNumber);
 }
 
-/**
- * Ambil metadata session dari file
- */
 export function getSession() {
   try {
     if (fs.existsSync(SESSION_FILE)) {
       const data = JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
-      console.log("[SESSION] Loaded session:", data);
+      console.log("[SESSION] Loaded session:", data.phone);
       return data;
     }
   } catch (err) {
@@ -32,9 +25,6 @@ export function getSession() {
   return null;
 }
 
-/**
- * Hapus session saat logout/reset
- */
 export function clearSession() {
   try {
     if (fs.existsSync(SESSION_FILE)) {

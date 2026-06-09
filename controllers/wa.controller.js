@@ -2,29 +2,32 @@ import { connectToWhatsApp } from "../index.js";
 import { rm } from "node:fs/promises";
 import { clearSession } from "../sessionManager.js";
 
+// Variabel untuk menyimpan status koneksi dan pairing code sementara
+let connectionPromise = null; // Untuk mencegah multiple connect simultan
+let pendingPairingCode = null; // Menyimpan pairing code untuk response
+
 export const sendMessage = async (req, res) => {
-  let globalSock = global.sock;
+  const globalSock = global.sock;
 
   try {
-    const { number, message } = req.query;
+    // Ubah ke POST, ambil dari body
+    const { number, message } = req.body;
 
     if (!number || !message) {
       return res.status(400).json({
         success: false,
-        message: "Parameter 'number' and 'message' required",
+        message: "Parameter 'number' and 'message' required in body",
       });
     }
 
-    if (!globalSock) {
+    if (!globalSock || !global.isConnected) {
       return res.status(503).json({
         success: false,
-        message: "WhatsApp socket not initialized. Call /registered first.",
+        message: "WhatsApp not connected. Please pair first.",
       });
     }
 
-    // Format nomor: hapus karakter non-digit, tambahkan @s.whatsapp.net
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-
     await globalSock.sendMessage(jid, { text: message });
 
     res
@@ -37,65 +40,124 @@ export const sendMessage = async (req, res) => {
 };
 
 export const getStatus = async (req, res) => {
-  let globalSock = global.sock;
-  console.log("[LOG SOCKET] state: ", globalSock);
-  try {
-    let isConnected = globalSock?.authState?.registered;
-    z;
-    // Cara 2: Cek dari WebSocket readyState (0 = CONNECTING, 1 = OPEN, 2 = CLOSING, 3 = CLOSED)
-    res.status(200).json({
-      success: true,
-      connected: isConnected ? true : false,
-      data: isConnected
+  const globalSock = global.sock;
+  const isConnected = global.isConnected === true;
+
+  res.status(200).json({
+    success: true,
+    connected: isConnected,
+    data:
+      isConnected && globalSock?.user
         ? {
-            id: globalSock.user?.id || null,
-            name: globalSock.user?.name || globalSock.user?.pushName || null,
+            id: globalSock.user.id || null,
+            name: globalSock.user.name || globalSock.user.pushName || null,
           }
         : null,
-    });
-  } catch (error) {
-    console.error("Error getting status:", error);
-    res.status(500).json({ success: false, message: "Failed to get status" });
-  }
+    pairingCode: pendingPairingCode, // Jika sedang menunggu pairing
+  });
 };
 
 export const checkRegistered = async (req, res) => {
   try {
-    const { phoneNumber, otpCodeManual } = req.body;
+    const { phoneNumber } = req.body; // Hanya butuh phoneNumber, tidak perlu OTP manual
 
-    if (!phoneNumber || !otpCodeManual) {
+    if (!phoneNumber) {
       return res.status(400).json({
         success: false,
-        message: " 'phoneNumber and 'otpCodeManual' required",
+        message: "'phoneNumber' required",
       });
     }
 
-    await rm("./auth_info", { recursive: true, force: true });
-    clearSession(); // Hapus session lama
+    // Jika sudah dalam proses koneksi, tolak permintaan baru
+    if (connectionPromise) {
+      return res.status(409).json({
+        success: false,
+        message: "Pairing process already in progress. Wait or restart.",
+      });
+    }
 
-    console.log("nomor hp:" + phoneNumber);
-    console.log("kode otp:", otpCodeManual);
+    // Reset state global
+    global.sock = null;
+    global.isConnected = false;
+    pendingPairingCode = null;
+
+    // Hapus auth lama untuk memulai pairing fresh (opsional, bisa dihapus jika ingin retain)
+    await rm("./auth_info", { recursive: true, force: true });
+    clearSession(); // Hapus metadata session
+
+    console.log("Starting pairing for phone number:", phoneNumber);
+
+    // Jalankan koneksi dan tunggu sampai pairing code didapat atau timeout
+    connectionPromise = connectToWhatsApp(phoneNumber);
+
+    // Kita perlu menunggu sampai event pairing-code keluar atau koneksi berhasil
+    // Karena connectToWhatsApp sekarang mengembalikan Promise yang resolve saat koneksi open ATAU reject jika gagal
+    // Namun untuk pairing code, kita tangkap di event dan simpan ke pendingPairingCode
+    // Kita akan response setelah koneksi berhasil atau setelah pairing code siap? Sebaiknya response dulu bahwa pairing dimulai,
+    // lalu client polling status untuk mendapatkan pairing code.
+
+    // Tapi agar lebih sederhana, kita tunggu maksimal 10 detik untuk mendapatkan pairing code
+    let codeReceived = false;
+    const codePromise = new Promise((resolve, reject) => {
+      const checkInterval = setInterval(() => {
+        if (pendingPairingCode) {
+          clearInterval(checkInterval);
+          resolve(pendingPairingCode);
+        }
+      }, 500);
+      setTimeout(() => {
+        clearInterval(checkInterval);
+        reject(new Error("Timeout waiting for pairing code"));
+      }, 10000);
+    });
 
     try {
-      await connectToWhatsApp(phoneNumber, otpCodeManual);
+      const code = await codePromise;
       res.status(200).json({
         success: true,
-        registered: true,
-        message:
-          "Device initialization started. Check pairing code in server logs.",
+        paired: false,
+        pairingCode: code,
+        message: `Use this pairing code in WhatsApp: ${code}`,
       });
     } catch (err) {
-      res.status(400).json({
-        success: false,
-        registered: false,
-        message: err.message,
-      });
+      // Jika timeout, tapi mungkin koneksi sudah berhasil? Cek status global
+      if (global.isConnected) {
+        res.status(200).json({
+          success: true,
+          paired: true,
+          message: "Already connected",
+        });
+      } else {
+        res.status(500).json({
+          success: false,
+          message: "Failed to get pairing code: " + err.message,
+        });
+      }
+    } finally {
+      connectionPromise = null;
     }
   } catch (error) {
-    console.error("Error checking registration:", error);
+    console.error("Error in pairing:", error);
+    connectionPromise = null;
     res.status(500).json({
       success: false,
       message: "Failed to initialize: " + error.message,
     });
+  }
+};
+
+// Fungsi untuk logout / reset
+export const logout = async (req, res) => {
+  try {
+    global.sock = null;
+    global.isConnected = false;
+    pendingPairingCode = null;
+    await rm("./auth_info", { recursive: true, force: true });
+    clearSession();
+    res
+      .status(200)
+      .json({ success: true, message: "Logged out and session cleared" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 };
