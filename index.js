@@ -13,12 +13,14 @@ const PORT = process.env.PORT || 4000;
 const app = express();
 const logger = P({ level: "silent" });
 
+// Global state
 global.sock = null;
 global.isConnected = false;
+global.pendingQR = null;
 global.pendingPairingCode = null;
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
-let isPairing = false; // untuk mencegah multiple pairing
+let isPairing = false; // mencegah multiple pairing
 
 export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
   if (isPairing) {
@@ -59,13 +61,15 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
       const { connection, lastDisconnect, pairingCode, qr } = update;
 
       if (pairingCode) {
-        console.log("✅ Pairing code:", pairingCode);
+        console.log("✅ Pairing code received:", pairingCode);
         global.pendingPairingCode = pairingCode;
       }
 
       if (qr) {
-        console.log("📱 QR code received (fallback)");
+        console.log("📱 QR code received (fallback) length:", qr.length);
         global.pendingQR = qr;
+        // Hapus pairing code jika ada
+        global.pendingPairingCode = null;
       }
 
       if (connection === "open") {
@@ -74,8 +78,8 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           clearTimeout(timeoutId);
           global.sock = sock;
           global.isConnected = true;
-          global.pendingPairingCode = null;
           global.pendingQR = null;
+          global.pendingPairingCode = null;
           reconnectAttempts = 0;
           if (phoneNumber) saveSession(phoneNumber);
           console.log("✅ WhatsApp Connected!");
@@ -85,23 +89,30 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
       }
 
       if (connection === "close") {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        // ================= PERBAIKAN UTAMA =================
+        // Cara membaca statusCode yang benar dari lastDisconnect
+        let statusCode = lastDisconnect?.error?.output?.statusCode;
+        // Fallback jika properti tersebut tidak ada
+        if (!statusCode && lastDisconnect?.error) {
+          statusCode = lastDisconnect.error.output?.statusCode;
+        }
         const errorMessage = lastDisconnect?.error?.message;
         console.log(
           `❌ Connection closed. Code: ${statusCode}, Msg: ${errorMessage}`,
         );
 
-        // 🔥 Tangani error 515 dengan restart socket dan pairing ulang
+        // Jika kode adalah 515, restart pairing
         if (statusCode === 515) {
           console.log("⚠️ 515 Stream Error – restarting pairing...");
+          // Bersihkan semua state dan folder auth
           await clearSession();
           await rm("./auth_info", { recursive: true, force: true }).catch(
             () => {},
           );
           global.sock = null;
           global.isConnected = false;
-          global.pendingPairingCode = null;
           global.pendingQR = null;
+          global.pendingPairingCode = null;
           isPairing = false;
 
           if (retryCount < MAX_RETRY) {
@@ -120,7 +131,7 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           return;
         }
 
-        // Untuk kode lain, lakukan reconnect biasa
+        // Untuk kode lain, lakukan reconnect biasa (misal 401, 403)
         const shouldReconnect =
           statusCode !== 401 && statusCode !== 403 && statusCode !== undefined;
         if (shouldReconnect && !resolved) {
@@ -138,8 +149,8 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           );
           global.sock = null;
           global.isConnected = false;
-          global.pendingPairingCode = null;
           global.pendingQR = null;
+          global.pendingPairingCode = null;
           isPairing = false;
           if (!resolved) reject(new Error("Unauthorized"));
         }
@@ -229,4 +240,3 @@ app.get("/", (req, res) =>
 app.use("/api/wa", waRoutes);
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 autoReconnect();
-// testing
