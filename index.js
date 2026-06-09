@@ -16,15 +16,14 @@ const logger = P({ level: "silent" });
 // Global state
 global.sock = null;
 global.isConnected = false;
-global.pendingQR = null;
 global.pendingPairingCode = null;
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
-let isPairing = false; // mencegah multiple pairing
+let isPairing = false;
 
 export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
   if (isPairing) {
-    console.log("Pairing already in progress, skip new request");
+    console.log("Pairing already in progress, skip");
     return;
   }
   isPairing = true;
@@ -49,8 +48,8 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
     const timeoutId = setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        sock.end(new Error("Connection timeout"));
-        reject(new Error("Timeout after 60 detik"));
+        sock.end(new Error("Timeout"));
+        reject(new Error("Timeout after 60s"));
         isPairing = false;
       }
     }, 60000);
@@ -58,18 +57,11 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, pairingCode, qr } = update;
+      const { connection, lastDisconnect, pairingCode } = update;
 
       if (pairingCode) {
-        console.log("✅ Pairing code received:", pairingCode);
+        console.log("✅ Pairing code:", pairingCode);
         global.pendingPairingCode = pairingCode;
-      }
-
-      if (qr) {
-        console.log("📱 QR code received (fallback) length:", qr.length);
-        global.pendingQR = qr;
-        // Hapus pairing code jika ada
-        global.pendingPairingCode = null;
       }
 
       if (connection === "open") {
@@ -78,7 +70,6 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           clearTimeout(timeoutId);
           global.sock = sock;
           global.isConnected = true;
-          global.pendingQR = null;
           global.pendingPairingCode = null;
           reconnectAttempts = 0;
           if (phoneNumber) saveSession(phoneNumber);
@@ -89,67 +80,57 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
       }
 
       if (connection === "close") {
-        // ================= PERBAIKAN UTAMA =================
-        // Cara membaca statusCode yang benar dari lastDisconnect
         let statusCode = lastDisconnect?.error?.output?.statusCode;
-        // Fallback jika properti tersebut tidak ada
         if (!statusCode && lastDisconnect?.error) {
           statusCode = lastDisconnect.error.output?.statusCode;
         }
         const errorMessage = lastDisconnect?.error?.message;
-        console.log(
-          `❌ Connection closed. Code: ${statusCode}, Msg: ${errorMessage}`,
-        );
+        console.log(`❌ Closed. Code: ${statusCode}, Msg: ${errorMessage}`);
 
-        // Jika kode adalah 515, restart pairing
         if (statusCode === 515) {
-          console.log("⚠️ 515 Stream Error – restarting pairing...");
-          // Bersihkan semua state dan folder auth
+          console.log("⚠️ 515 Stream Error – restart pairing");
           await clearSession();
           await rm("./auth_info", { recursive: true, force: true }).catch(
             () => {},
           );
           global.sock = null;
           global.isConnected = false;
-          global.pendingQR = null;
           global.pendingPairingCode = null;
           isPairing = false;
 
           if (retryCount < MAX_RETRY) {
             console.log(
-              `🔄 Retry pairing (${retryCount + 1}/${MAX_RETRY}) after ${retryDelay}ms`,
+              `🔄 Retry (${retryCount + 1}/${MAX_RETRY}) after ${retryDelay}ms`,
             );
             setTimeout(() => {
-              connectToWhatsApp(phoneNumber, retryCount + 1).catch((err) => {
-                console.error("Retry failed:", err);
-              });
+              connectToWhatsApp(phoneNumber, retryCount + 1).catch(
+                console.error,
+              );
             }, retryDelay);
           } else {
-            console.log("Max retry reached, pairing failed permanently.");
-            if (!resolved) reject(new Error("Max retry for 515 error"));
+            console.log("Max retry reached");
+            if (!resolved) reject(new Error("Max retry 515"));
           }
           return;
         }
 
-        // Untuk kode lain, lakukan reconnect biasa (misal 401, 403)
         const shouldReconnect =
           statusCode !== 401 && statusCode !== 403 && statusCode !== undefined;
         if (shouldReconnect && !resolved) {
           resolved = true;
           clearTimeout(timeoutId);
-          reject(new Error(`Connection closed before open: ${errorMessage}`));
+          reject(new Error(`Closed before open: ${errorMessage}`));
           isPairing = false;
         } else if (shouldReconnect && resolved) {
           scheduleReconnect();
         } else {
-          console.log("Session invalid (401/403), clearing auth...");
+          console.log("Unauthorized, clear auth");
           await clearSession();
           await rm("./auth_info", { recursive: true, force: true }).catch(
             () => {},
           );
           global.sock = null;
           global.isConnected = false;
-          global.pendingQR = null;
           global.pendingPairingCode = null;
           isPairing = false;
           if (!resolved) reject(new Error("Unauthorized"));
@@ -157,7 +138,7 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
       }
     });
 
-    // Minta pairing code (prioritas) – lebih stabil
+    // Hanya minta pairing code, tidak pakai QR
     const isRegistered =
       sock.authState?.creds?.registered === true || sock.user !== undefined;
     if (!isRegistered && phoneNumber) {
@@ -167,7 +148,7 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           await sock.requestPairingCode(phoneNumber);
           console.log("Pairing code request sent");
         } catch (err) {
-          console.error("Gagal minta pairing code:", err);
+          console.error("Failed request pairing code:", err);
           if (!resolved) {
             resolved = true;
             clearTimeout(timeoutId);
@@ -177,14 +158,9 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
         }
       }, 3000);
     } else if (isRegistered) {
-      console.log("Existing session found, waiting for connection...");
+      console.log("Existing session, waiting...");
     } else {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeoutId);
-        reject(new Error("Phone number required"));
-        isPairing = false;
-      }
+      if (!resolved) reject(new Error("Phone number required"));
     }
   });
 }
@@ -194,14 +170,9 @@ function scheduleReconnect() {
   const maxAttempts = 10;
   const baseDelay = 5000;
   const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts), 60000);
-  if (reconnectAttempts >= maxAttempts) {
-    console.log("Max reconnect attempts reached.");
-    return;
-  }
+  if (reconnectAttempts >= maxAttempts) return;
   reconnectAttempts++;
-  console.log(
-    `Scheduling reconnect attempt ${reconnectAttempts} in ${delay / 1000}s...`,
-  );
+  console.log(`Reconnect in ${delay / 1000}s`);
   reconnectTimeout = setTimeout(async () => {
     const session = getSession();
     if (session?.phone) {
@@ -209,7 +180,6 @@ function scheduleReconnect() {
         await connectToWhatsApp(session.phone);
         reconnectAttempts = 0;
       } catch (err) {
-        console.error("Reconnect failed:", err);
         scheduleReconnect();
       }
     }
@@ -219,12 +189,11 @@ function scheduleReconnect() {
 export async function autoReconnect() {
   const session = getSession();
   if (session?.phone) {
-    console.log("Auto-reconnecting with saved phone:", session.phone);
+    console.log("Auto-reconnect with:", session.phone);
     try {
       await connectToWhatsApp(session.phone);
       return true;
     } catch (err) {
-      console.error("Auto-reconnect failed:", err);
       clearSession();
       return false;
     }
