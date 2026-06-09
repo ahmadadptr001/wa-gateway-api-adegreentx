@@ -13,8 +13,10 @@ const PORT = process.env.PORT || 4000;
 const app = express();
 const logger = P({ level: "silent" });
 
+// Global state
 global.sock = null;
 global.isConnected = false;
+global.pendingQR = null;
 global.pendingPairingCode = null;
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
@@ -28,7 +30,10 @@ export async function connectToWhatsApp(phoneNumber) {
       version,
       logger,
       auth: state,
-      browser: ["Ubuntu", "Chrome", "20.0.0"],
+      browser: ["Chrome (Linux)", "", ""],
+      connectTimeoutMs: 30000,
+      defaultQueryTimeoutMs: 30000,
+      keepAliveIntervalMs: 30000,
     });
 
     let resolved = false;
@@ -40,27 +45,23 @@ export async function connectToWhatsApp(phoneNumber) {
       }
     }, 60000);
 
-    // Event pairing code
-    sock.ev.on("pairing-code", (code) => {
-      console.log("Pairing code received:", code);
-      global.pendingPairingCode = code;
-    });
-
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, pairingCode, qr } = update;
 
-      // Tangkap pairingCode dari update (cara yang benar di Baileys versi terbaru)
-      if (pairingCode) {
-        console.log("✅ Pairing code received from update:", pairingCode);
-        global.pendingPairingCode = pairingCode;
+      // Tangkap QR code
+      if (qr) {
+        console.log("QR Code received, length:", qr.length);
+        global.pendingQR = qr;
+        global.pendingPairingCode = null;
       }
 
-      // Jika dapat QR (fallback), tampilkan juga
-      if (qr) {
-        console.log("QR Code received (fallback):", qr);
-        // Bisa juga disimpan ke global jika ingin pakai QR
+      // Tangkap pairing code (opsional)
+      if (pairingCode) {
+        console.log("Pairing code received:", pairingCode);
+        global.pendingPairingCode = pairingCode;
+        global.pendingQR = null;
       }
 
       if (connection === "open") {
@@ -69,6 +70,7 @@ export async function connectToWhatsApp(phoneNumber) {
           clearTimeout(timeoutId);
           global.sock = sock;
           global.isConnected = true;
+          global.pendingQR = null;
           global.pendingPairingCode = null;
           reconnectAttempts = 0;
           if (phoneNumber) saveSession(phoneNumber);
@@ -113,35 +115,24 @@ export async function connectToWhatsApp(phoneNumber) {
           } catch (err) {}
           global.sock = null;
           global.isConnected = false;
+          global.pendingQR = null;
           global.pendingPairingCode = null;
         }
       }
     });
 
+    // Tidak perlu requestPairingCode, biarkan QR code yang keluar
     const isRegistered =
       sock.authState?.creds?.registered === true || sock.user !== undefined;
     if (!isRegistered && phoneNumber) {
-      // Delay agar websocket siap
-      setTimeout(async () => {
-        try {
-          await sock.requestPairingCode(phoneNumber);
-          console.log("Requested pairing code for", phoneNumber);
-        } catch (err) {
-          console.error("Error requesting pairing code:", err);
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeoutId);
-            reject(err);
-          }
-        }
-      }, 2000);
+      console.log("Waiting for QR code to appear...");
     } else if (isRegistered) {
       console.log("Existing session found, waiting for connection...");
     } else {
       if (!resolved) {
         resolved = true;
         clearTimeout(timeoutId);
-        reject(new Error("Phone number required for pairing"));
+        reject(new Error("Phone number required but no session"));
       }
     }
   });
@@ -191,11 +182,14 @@ export async function autoReconnect() {
   return false;
 }
 
+// Express setup
 app.use(cors());
 app.use(express.json());
+
 app.get("/", (req, res) =>
   res.json({ success: true, message: "WA Gateway API" }),
 );
 app.use("/api/wa", waRoutes);
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 autoReconnect();

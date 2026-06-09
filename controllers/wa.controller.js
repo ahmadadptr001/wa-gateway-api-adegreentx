@@ -38,11 +38,12 @@ export const sendMessage = async (req, res) => {
 export const getStatus = async (req, res) => {
   const isConnected = global.isConnected === true;
   const pairingCode = global.pendingPairingCode || null;
+  const qrCode = global.pendingQR || null;
   res.status(200).json({
     success: true,
     connected: isConnected,
     pairingCode: pairingCode,
-    pairingInProgress: pairingInProgress,
+    qrCode: qrCode,
     data:
       isConnected && global.sock?.user
         ? {
@@ -74,10 +75,11 @@ export const checkRegistered = async (req, res) => {
     // Reset state
     global.sock = null;
     global.isConnected = false;
+    global.pendingQR = null;
     global.pendingPairingCode = null;
     pairingInProgress = true;
 
-    // Hapus auth lama (opsional, bisa dihapus jika ingin retain)
+    // Hapus auth lama
     try {
       await rm("./auth_info", { recursive: true, force: true });
     } catch (err) {}
@@ -85,17 +87,15 @@ export const checkRegistered = async (req, res) => {
 
     console.log("Starting pairing for phone number:", phoneNumber);
 
-    // Jalankan pairing di background, jangan di-await
+    // Jalankan pairing di background
     connectToWhatsApp(phoneNumber).catch((err) => {
       console.error("Background pairing error:", err);
       pairingInProgress = false;
     });
 
-    // Langsung response sukses, client akan polling status untuk mendapatkan pairing code
     res.status(200).json({
       success: true,
-      message:
-        "Pairing initiated. Please check status endpoint for pairing code.",
+      message: "Pairing initiated. Please check status endpoint for QR code.",
     });
   } catch (error) {
     console.error("Error starting pairing:", error);
@@ -113,6 +113,7 @@ export const logout = async (req, res) => {
   try {
     global.sock = null;
     global.isConnected = false;
+    global.pendingQR = null;
     global.pendingPairingCode = null;
     pairingInProgress = false;
     await rm("./auth_info", { recursive: true, force: true });
