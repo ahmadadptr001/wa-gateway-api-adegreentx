@@ -13,17 +13,12 @@ const PORT = process.env.PORT || 4000;
 const app = express();
 const logger = P({ level: "silent" });
 
-// State global
 global.sock = null;
 global.isConnected = false;
-global.pendingPairingCode = null; // Untuk menyimpan pairing code
+global.pendingPairingCode = null;
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
 
-/**
- * Connect to WhatsApp dan return Promise yang resolve saat koneksi open atau reject jika gagal.
- * Jika belum terautentikasi, akan menghasilkan pairing code dan menyimpannya ke global.pendingPairingCode.
- */
 export async function connectToWhatsApp(phoneNumber) {
   return new Promise(async (resolve, reject) => {
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
@@ -45,11 +40,10 @@ export async function connectToWhatsApp(phoneNumber) {
       }
     }, 60000);
 
-    // Event untuk pairing code (jika belum terautentikasi)
+    // Event pairing code
     sock.ev.on("pairing-code", (code) => {
       console.log("Pairing code received:", code);
       global.pendingPairingCode = code;
-      // Jangan resolve di sini, tunggu koneksi open
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -65,10 +59,7 @@ export async function connectToWhatsApp(phoneNumber) {
           global.isConnected = true;
           global.pendingPairingCode = null;
           reconnectAttempts = 0;
-
-          if (phoneNumber) {
-            saveSession(phoneNumber);
-          }
+          if (phoneNumber) saveSession(phoneNumber);
           console.log("✅ WhatsApp Connected!");
           resolve(sock);
         }
@@ -78,7 +69,6 @@ export async function connectToWhatsApp(phoneNumber) {
         global.isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== 401 && statusCode !== 403;
-
         console.log("❌ Connection closed. Status code:", statusCode);
 
         if (shouldReconnect && !resolved) {
@@ -94,14 +84,11 @@ export async function connectToWhatsApp(phoneNumber) {
         } else if (shouldReconnect && resolved) {
           scheduleReconnect();
         } else {
-          // 401 Unauthorized, hapus session dan tidak usah reconnect
           console.log("Session invalid, clearing auth folder...");
           await clearSession();
           try {
             await rm("./auth_info", { recursive: true, force: true });
-          } catch (err) {
-            console.error("Error removing auth_info:", err);
-          }
+          } catch (err) {}
           global.sock = null;
           global.isConnected = false;
           global.pendingPairingCode = null;
@@ -109,12 +96,10 @@ export async function connectToWhatsApp(phoneNumber) {
       }
     });
 
-    // Cek apakah sudah memiliki credentials yang valid
     const isRegistered =
       sock.authState?.creds?.registered === true || sock.user !== undefined;
-
     if (!isRegistered && phoneNumber) {
-      // Tunggu sebentar agar websocket siap sebelum minta pairing code
+      // Delay agar websocket siap
       setTimeout(async () => {
         try {
           await sock.requestPairingCode(phoneNumber);
@@ -127,7 +112,7 @@ export async function connectToWhatsApp(phoneNumber) {
             reject(err);
           }
         }
-      }, 2000); // Delay 2 detik untuk menghindari error 428
+      }, 2000);
     } else if (isRegistered) {
       console.log("Existing session found, waiting for connection...");
     } else {
@@ -142,21 +127,17 @@ export async function connectToWhatsApp(phoneNumber) {
 
 function scheduleReconnect() {
   if (reconnectTimeout) clearTimeout(reconnectTimeout);
-
   const maxAttempts = 10;
   const baseDelay = 5000;
   const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts), 60000);
-
   if (reconnectAttempts >= maxAttempts) {
-    console.log("Max reconnect attempts reached. Manual restart required.");
+    console.log("Max reconnect attempts reached.");
     return;
   }
-
   reconnectAttempts++;
   console.log(
     `Scheduling reconnect attempt ${reconnectAttempts} in ${delay / 1000}s...`,
   );
-
   reconnectTimeout = setTimeout(async () => {
     const session = getSession();
     if (session && session.phone) {
@@ -168,8 +149,6 @@ function scheduleReconnect() {
         console.error("Reconnect failed:", err);
         scheduleReconnect();
       }
-    } else {
-      console.log("No saved phone number, cannot auto-reconnect");
     }
   }, delay);
 }
@@ -180,7 +159,6 @@ export async function autoReconnect() {
     console.log("Auto-reconnecting with saved phone:", session.phone);
     try {
       await connectToWhatsApp(session.phone);
-      console.log("Auto-reconnect successful");
       return true;
     } catch (err) {
       console.error("Auto-reconnect failed:", err);
@@ -191,19 +169,11 @@ export async function autoReconnect() {
   return false;
 }
 
-// Express setup
 app.use(cors());
 app.use(express.json());
-
-app.get("/", (req, res) => {
-  res.status(200).json({ success: true, message: "Welcome to WA Gateway API" });
-});
-
+app.get("/", (req, res) =>
+  res.json({ success: true, message: "WA Gateway API" }),
+);
 app.use("/api/wa", waRoutes);
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-// Auto-reconnect setelah server jalan
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 autoReconnect();
