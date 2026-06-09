@@ -32,11 +32,9 @@ export const sendMessage = async (req, res) => {
 
 export const getStatus = async (req, res) => {
   const isConnected = global.isConnected === true;
-  const pairingCode = global.pendingPairingCode || null;
   res.status(200).json({
     success: true,
     connected: isConnected,
-    pairingCode: pairingCode, // hanya ini yang dikirim
     data:
       isConnected && global.sock?.user
         ? {
@@ -49,11 +47,14 @@ export const getStatus = async (req, res) => {
 
 export const checkRegistered = async (req, res) => {
   try {
-    const { phoneNumber } = req.body;
-    if (!phoneNumber) {
+    let { phoneNumber, otpCodeManual } = req.body;
+    if (!phoneNumber || !otpCodeManual) {
       return res
         .status(400)
-        .json({ success: false, message: "phoneNumber required" });
+        .json({
+          success: false,
+          message: "phoneNumber and otpCodeManual required",
+        });
     }
     if (pairingInProgress) {
       return res
@@ -64,17 +65,21 @@ export const checkRegistered = async (req, res) => {
     // Reset state
     global.sock = null;
     global.isConnected = false;
-    global.pendingPairingCode = null;
     pairingInProgress = true;
 
-    // Hapus auth lama (fresh start)
+    // Hapus auth lama
     try {
       await rm("./auth_info", { recursive: true, force: true });
     } catch (err) {}
     clearSession();
 
-    console.log("Starting pairing for:", phoneNumber);
-    connectToWhatsApp(phoneNumber).catch((err) => {
+    console.log(
+      "Starting pairing for:",
+      phoneNumber,
+      "with custom OTP:",
+      otpCodeManual,
+    );
+    connectToWhatsApp(phoneNumber, otpCodeManual).catch((err) => {
       console.error("Background pairing error:", err);
       pairingInProgress = false;
     });
@@ -83,10 +88,10 @@ export const checkRegistered = async (req, res) => {
       .status(200)
       .json({
         success: true,
-        message: "Pairing initiated. Poll /status for pairing code.",
+        message: "Pairing initiated. Please wait for connection.",
       });
   } catch (error) {
-    console.error("Error start pairing:", error);
+    console.error("Error starting pairing:", error);
     pairingInProgress = false;
     res.status(500).json({ success: false, message: error.message });
   }
@@ -96,7 +101,6 @@ export const logout = async (req, res) => {
   try {
     global.sock = null;
     global.isConnected = false;
-    global.pendingPairingCode = null;
     pairingInProgress = false;
     await rm("./auth_info", { recursive: true, force: true });
     clearSession();
