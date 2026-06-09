@@ -49,7 +49,19 @@ export async function connectToWhatsApp(phoneNumber) {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect } = update;
+      const { connection, lastDisconnect, pairingCode, qr } = update;
+
+      // Tangkap pairingCode dari update (cara yang benar di Baileys versi terbaru)
+      if (pairingCode) {
+        console.log("✅ Pairing code received from update:", pairingCode);
+        global.pendingPairingCode = pairingCode;
+      }
+
+      // Jika dapat QR (fallback), tampilkan juga
+      if (qr) {
+        console.log("QR Code received (fallback):", qr);
+        // Bisa juga disimpan ke global jika ingin pakai QR
+      }
 
       if (connection === "open") {
         if (!resolved) {
@@ -68,8 +80,16 @@ export async function connectToWhatsApp(phoneNumber) {
       if (connection === "close") {
         global.isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== 401 && statusCode !== 403;
-        console.log("❌ Connection closed. Status code:", statusCode);
+        const errorMessage = lastDisconnect?.error?.message;
+        console.log(
+          "❌ Connection closed. Status code:",
+          statusCode,
+          "Error:",
+          errorMessage,
+        );
+
+        const shouldReconnect =
+          statusCode !== 401 && statusCode !== 403 && statusCode !== undefined;
 
         if (shouldReconnect && !resolved) {
           if (!resolved) {
@@ -77,14 +97,16 @@ export async function connectToWhatsApp(phoneNumber) {
             clearTimeout(timeoutId);
             reject(
               new Error(
-                `Connection closed before open: ${lastDisconnect?.error}`,
+                `Connection closed before open: ${errorMessage || lastDisconnect?.error}`,
               ),
             );
           }
         } else if (shouldReconnect && resolved) {
           scheduleReconnect();
         } else {
-          console.log("Session invalid, clearing auth folder...");
+          console.log(
+            "Session invalid or unrecoverable, clearing auth folder...",
+          );
           await clearSession();
           try {
             await rm("./auth_info", { recursive: true, force: true });
