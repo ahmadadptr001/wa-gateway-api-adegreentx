@@ -13,16 +13,24 @@ const PORT = process.env.PORT || 4000;
 const app = express();
 const logger = P({ level: "silent" });
 
-// Global state
 global.sock = null;
 global.isConnected = false;
-global.pendingQR = null;
 global.pendingPairingCode = null;
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
+let isPairing = false; // untuk mencegah multiple pairing
 
-export async function connectToWhatsApp(phoneNumber) {
+export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
+  if (isPairing) {
+    console.log("Pairing already in progress, skip new request");
+    return;
+  }
+  isPairing = true;
+  const MAX_RETRY = 5;
+  const retryDelay = 3000;
+
   return new Promise(async (resolve, reject) => {
+    let resolved = false;
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
     const { version } = await fetchLatestBaileysVersion();
 
@@ -30,18 +38,18 @@ export async function connectToWhatsApp(phoneNumber) {
       version,
       logger,
       auth: state,
-      browser: ["Chrome (Linux)", "", ""],
+      browser: ["Edge", "Windows", "10.0"],
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 30000,
       keepAliveIntervalMs: 30000,
     });
 
-    let resolved = false;
     const timeoutId = setTimeout(() => {
       if (!resolved) {
         resolved = true;
         sock.end(new Error("Connection timeout"));
-        reject(new Error("Connection timeout after 60 seconds"));
+        reject(new Error("Timeout after 60 detik"));
+        isPairing = false;
       }
     }, 60000);
 
@@ -50,18 +58,14 @@ export async function connectToWhatsApp(phoneNumber) {
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, pairingCode, qr } = update;
 
-      // Tangkap QR code
-      if (qr) {
-        console.log("QR Code received, length:", qr.length);
-        global.pendingQR = qr;
-        global.pendingPairingCode = null;
+      if (pairingCode) {
+        console.log("✅ Pairing code:", pairingCode);
+        global.pendingPairingCode = pairingCode;
       }
 
-      // Tangkap pairing code (opsional)
-      if (pairingCode) {
-        console.log("Pairing code received:", pairingCode);
-        global.pendingPairingCode = pairingCode;
-        global.pendingQR = null;
+      if (qr) {
+        console.log("📱 QR code received (fallback)");
+        global.pendingQR = qr;
       }
 
       if (connection === "open") {
@@ -70,69 +74,105 @@ export async function connectToWhatsApp(phoneNumber) {
           clearTimeout(timeoutId);
           global.sock = sock;
           global.isConnected = true;
-          global.pendingQR = null;
           global.pendingPairingCode = null;
+          global.pendingQR = null;
           reconnectAttempts = 0;
           if (phoneNumber) saveSession(phoneNumber);
           console.log("✅ WhatsApp Connected!");
+          isPairing = false;
           resolve(sock);
         }
       }
 
       if (connection === "close") {
-        global.isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errorMessage = lastDisconnect?.error?.message;
         console.log(
-          "❌ Connection closed. Status code:",
-          statusCode,
-          "Error:",
-          errorMessage,
+          `❌ Connection closed. Code: ${statusCode}, Msg: ${errorMessage}`,
         );
 
+        // 🔥 Tangani error 515 dengan restart socket dan pairing ulang
+        if (statusCode === 515) {
+          console.log("⚠️ 515 Stream Error – restarting pairing...");
+          await clearSession();
+          await rm("./auth_info", { recursive: true, force: true }).catch(
+            () => {},
+          );
+          global.sock = null;
+          global.isConnected = false;
+          global.pendingPairingCode = null;
+          global.pendingQR = null;
+          isPairing = false;
+
+          if (retryCount < MAX_RETRY) {
+            console.log(
+              `🔄 Retry pairing (${retryCount + 1}/${MAX_RETRY}) after ${retryDelay}ms`,
+            );
+            setTimeout(() => {
+              connectToWhatsApp(phoneNumber, retryCount + 1).catch((err) => {
+                console.error("Retry failed:", err);
+              });
+            }, retryDelay);
+          } else {
+            console.log("Max retry reached, pairing failed permanently.");
+            if (!resolved) reject(new Error("Max retry for 515 error"));
+          }
+          return;
+        }
+
+        // Untuk kode lain, lakukan reconnect biasa
         const shouldReconnect =
           statusCode !== 401 && statusCode !== 403 && statusCode !== undefined;
-
         if (shouldReconnect && !resolved) {
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeoutId);
-            reject(
-              new Error(
-                `Connection closed before open: ${errorMessage || lastDisconnect?.error}`,
-              ),
-            );
-          }
+          resolved = true;
+          clearTimeout(timeoutId);
+          reject(new Error(`Connection closed before open: ${errorMessage}`));
+          isPairing = false;
         } else if (shouldReconnect && resolved) {
           scheduleReconnect();
         } else {
-          console.log(
-            "Session invalid or unrecoverable, clearing auth folder...",
-          );
+          console.log("Session invalid (401/403), clearing auth...");
           await clearSession();
-          try {
-            await rm("./auth_info", { recursive: true, force: true });
-          } catch (err) {}
+          await rm("./auth_info", { recursive: true, force: true }).catch(
+            () => {},
+          );
           global.sock = null;
           global.isConnected = false;
-          global.pendingQR = null;
           global.pendingPairingCode = null;
+          global.pendingQR = null;
+          isPairing = false;
+          if (!resolved) reject(new Error("Unauthorized"));
         }
       }
     });
 
-    // Tidak perlu requestPairingCode, biarkan QR code yang keluar
+    // Minta pairing code (prioritas) – lebih stabil
     const isRegistered =
       sock.authState?.creds?.registered === true || sock.user !== undefined;
     if (!isRegistered && phoneNumber) {
-      console.log("Waiting for QR code to appear...");
+      console.log("Requesting pairing code for", phoneNumber);
+      setTimeout(async () => {
+        try {
+          await sock.requestPairingCode(phoneNumber);
+          console.log("Pairing code request sent");
+        } catch (err) {
+          console.error("Gagal minta pairing code:", err);
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutId);
+            reject(err);
+            isPairing = false;
+          }
+        }
+      }, 3000);
     } else if (isRegistered) {
       console.log("Existing session found, waiting for connection...");
     } else {
       if (!resolved) {
         resolved = true;
         clearTimeout(timeoutId);
-        reject(new Error("Phone number required but no session"));
+        reject(new Error("Phone number required"));
+        isPairing = false;
       }
     }
   });
@@ -153,10 +193,9 @@ function scheduleReconnect() {
   );
   reconnectTimeout = setTimeout(async () => {
     const session = getSession();
-    if (session && session.phone) {
+    if (session?.phone) {
       try {
         await connectToWhatsApp(session.phone);
-        console.log("Reconnect successful");
         reconnectAttempts = 0;
       } catch (err) {
         console.error("Reconnect failed:", err);
@@ -168,7 +207,7 @@ function scheduleReconnect() {
 
 export async function autoReconnect() {
   const session = getSession();
-  if (session && session.phone) {
+  if (session?.phone) {
     console.log("Auto-reconnecting with saved phone:", session.phone);
     try {
       await connectToWhatsApp(session.phone);
@@ -182,14 +221,11 @@ export async function autoReconnect() {
   return false;
 }
 
-// Express setup
 app.use(cors());
 app.use(express.json());
-
 app.get("/", (req, res) =>
   res.json({ success: true, message: "WA Gateway API" }),
 );
 app.use("/api/wa", waRoutes);
-
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 autoReconnect();
