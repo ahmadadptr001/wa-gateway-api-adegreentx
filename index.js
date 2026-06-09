@@ -39,7 +39,7 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
       version,
       logger,
       auth: state,
-      browser: ["Edge", "Windows", "10.0"], // User-agent yang familiar
+      browser: ["Edge", "Windows", "10.0", "Ubuntu", "Chrome"], // User-agent yang familiar
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 30000,
       keepAliveIntervalMs: 30000,
