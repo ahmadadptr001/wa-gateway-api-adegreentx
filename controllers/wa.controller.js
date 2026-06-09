@@ -8,12 +8,10 @@ export const sendMessage = async (req, res) => {
   try {
     const { number, message } = req.body;
     if (!number || !message) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "Parameter 'number' and 'message' required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "Parameter 'number' and 'message' required",
+      });
     }
     if (!global.sock || !global.isConnected) {
       return res
@@ -46,39 +44,36 @@ export const checkRegistered = async (req, res) => {
   try {
     const { phoneNumber, otpCodeManual } = req.body;
     if (!phoneNumber || !otpCodeManual) {
-      return res
-        .status(400)
-        .json({
-          success: false,
-          message: "phoneNumber and otpCodeManual required",
-        });
+      return res.status(400).json({
+        success: false,
+        message: "phoneNumber and otpCodeManual required",
+      });
     }
     if (pairingInProgress) {
       return res
         .status(409)
         .json({ success: false, message: "Pairing already in progress" });
     }
+
     pairingInProgress = true;
 
     // Reset state
     global.sock = null;
     global.isConnected = false;
 
-    // Hapus auth lama untuk fresh start
-    await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
-    clearSession();
+    // JANGAN hapus auth_info di sini! Biarkan startWhatsApp yang mengelola
 
     console.log(
       `Memulai pairing untuk ${phoneNumber} dengan kode: ${otpCodeManual}`,
     );
-    // Jalankan startWhatsApp tanpa await (biar background) tapi kita tetap respon cepat
-    startWhatsApp(phoneNumber, otpCodeManual)
+
+    // Jalankan startWhatsApp dengan flag pairing = true
+    startWhatsApp(phoneNumber, otpCodeManual, true)
       .catch((err) => {
         console.error("Pairing error:", err);
         pairingInProgress = false;
       })
       .finally(() => {
-        // Beri jeda agar tidak double start
         setTimeout(() => {
           pairingInProgress = false;
         }, 5000);
@@ -86,7 +81,7 @@ export const checkRegistered = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: `Kode pairing "${otpCodeManual}" dikirim. Buka WhatsApp -> Settings -> Linked Devices -> Link a Device -> Link with phone number, masukkan kode tersebut.`,
+      message: `Meminta pairing dengan kode "${otpCodeManual}". Buka WhatsApp -> Perangkat Tertaut -> Tautkan Perangkat -> Tautkan dengan nomor telepon, masukkan kode tersebut.`,
     });
   } catch (error) {
     console.error("Error:", error);
@@ -100,8 +95,9 @@ export const logout = async (req, res) => {
     global.sock = null;
     global.isConnected = false;
     pairingInProgress = false;
+    // Hapus auth folder hanya saat logout manual
     await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
-    clearSession();
+    await clearSession();
     res.status(200).json({ success: true, message: "Logged out" });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
