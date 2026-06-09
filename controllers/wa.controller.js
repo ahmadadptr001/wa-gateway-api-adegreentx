@@ -1,11 +1,10 @@
-import { connectToWhatsApp } from "../index.js";
+import { startWhatsApp } from "../index.js";
 import { rm } from "node:fs/promises";
 import { clearSession } from "../sessionManager.js";
 
 let pairingInProgress = false;
 
 export const sendMessage = async (req, res) => {
-  const globalSock = global.sock;
   try {
     const { number, message } = req.body;
     if (!number || !message) {
@@ -16,13 +15,13 @@ export const sendMessage = async (req, res) => {
           message: "Parameter 'number' and 'message' required",
         });
     }
-    if (!globalSock || !global.isConnected) {
+    if (!global.sock || !global.isConnected) {
       return res
         .status(503)
         .json({ success: false, message: "WhatsApp not connected" });
     }
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-    await globalSock.sendMessage(jid, { text: message });
+    await global.sock.sendMessage(jid, { text: message });
     res.status(200).json({ success: true, message: "Message sent" });
   } catch (error) {
     console.error("Send error:", error);
@@ -31,23 +30,21 @@ export const sendMessage = async (req, res) => {
 };
 
 export const getStatus = async (req, res) => {
-  const isConnected = global.isConnected === true;
   res.status(200).json({
     success: true,
-    connected: isConnected,
-    data:
-      isConnected && global.sock?.user
-        ? {
-            id: global.sock.user.id,
-            name: global.sock.user.name || global.sock.user.pushName,
-          }
-        : null,
+    connected: global.isConnected === true,
+    data: global.sock?.user
+      ? {
+          id: global.sock.user.id,
+          name: global.sock.user.name || global.sock.user.pushName,
+        }
+      : null,
   });
 };
 
 export const checkRegistered = async (req, res) => {
   try {
-    let { phoneNumber, otpCodeManual } = req.body;
+    const { phoneNumber, otpCodeManual } = req.body;
     if (!phoneNumber || !otpCodeManual) {
       return res
         .status(400)
@@ -61,37 +58,38 @@ export const checkRegistered = async (req, res) => {
         .status(409)
         .json({ success: false, message: "Pairing already in progress" });
     }
+    pairingInProgress = true;
 
     // Reset state
     global.sock = null;
     global.isConnected = false;
-    pairingInProgress = true;
 
-    // Hapus auth lama
-    try {
-      await rm("./auth_info", { recursive: true, force: true });
-    } catch (err) {}
+    // Hapus auth lama untuk fresh start
+    await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
     clearSession();
 
     console.log(
-      "Starting pairing for:",
-      phoneNumber,
-      "with custom OTP:",
-      otpCodeManual,
+      `Memulai pairing untuk ${phoneNumber} dengan kode: ${otpCodeManual}`,
     );
-    connectToWhatsApp(phoneNumber, otpCodeManual).catch((err) => {
-      console.error("Background pairing error:", err);
-      pairingInProgress = false;
-    });
-
-    res
-      .status(200)
-      .json({
-        success: true,
-        message: "Pairing initiated. Please wait for connection.",
+    // Jalankan startWhatsApp tanpa await (biar background) tapi kita tetap respon cepat
+    startWhatsApp(phoneNumber, otpCodeManual)
+      .catch((err) => {
+        console.error("Pairing error:", err);
+        pairingInProgress = false;
+      })
+      .finally(() => {
+        // Beri jeda agar tidak double start
+        setTimeout(() => {
+          pairingInProgress = false;
+        }, 5000);
       });
+
+    res.status(200).json({
+      success: true,
+      message: `Kode pairing "${otpCodeManual}" dikirim. Buka WhatsApp -> Settings -> Linked Devices -> Link a Device -> Link with phone number, masukkan kode tersebut.`,
+    });
   } catch (error) {
-    console.error("Error starting pairing:", error);
+    console.error("Error:", error);
     pairingInProgress = false;
     res.status(500).json({ success: false, message: error.message });
   }
@@ -102,7 +100,7 @@ export const logout = async (req, res) => {
     global.sock = null;
     global.isConnected = false;
     pairingInProgress = false;
-    await rm("./auth_info", { recursive: true, force: true });
+    await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
     clearSession();
     res.status(200).json({ success: true, message: "Logged out" });
   } catch (error) {

@@ -10,7 +10,7 @@ export function saveSession(phoneNumber, otpCodeManual) {
     savedAt: new Date().toISOString(),
   };
   fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
-  console.log("[SESSION] Saved phone & OTP");
+  console.log("[SESSION] Tersimpan:", phoneNumber);
 }
 
 export function getSession() {
