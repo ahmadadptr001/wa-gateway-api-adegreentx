@@ -7,9 +7,9 @@ import {
   logout,
 } from "../controllers/wa.controller.js";
 
-router.post("/send-message", sendMessage); // ubah ke POST
+router.post("/send-message", sendMessage);
 router.get("/status", getStatus);
 router.post("/registered", checkRegistered);
-router.post("/logout", logout); // endpoint baru untuk reset
+router.post("/logout", logout);
 
 export default router;

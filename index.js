@@ -7,6 +7,7 @@ import express from "express";
 import cors from "cors";
 import P from "pino";
 import { saveSession, getSession, clearSession } from "./sessionManager.js";
+import { rm } from "node:fs/promises";
 
 const PORT = process.env.PORT || 4000;
 const app = express();
@@ -15,6 +16,7 @@ const logger = P({ level: "silent" });
 // State global
 global.sock = null;
 global.isConnected = false;
+global.pendingPairingCode = null; // Untuk menyimpan pairing code
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
 
@@ -24,8 +26,7 @@ let reconnectTimeout = null;
  */
 export async function connectToWhatsApp(phoneNumber) {
   return new Promise(async (resolve, reject) => {
-    const authState = await useMultiFileAuthState("auth_info");
-    const { state, saveCreds } = authState;
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info");
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -36,7 +37,7 @@ export async function connectToWhatsApp(phoneNumber) {
     });
 
     let resolved = false;
-    let timeoutId = setTimeout(() => {
+    const timeoutId = setTimeout(() => {
       if (!resolved) {
         resolved = true;
         sock.end(new Error("Connection timeout"));
@@ -63,11 +64,10 @@ export async function connectToWhatsApp(phoneNumber) {
           global.sock = sock;
           global.isConnected = true;
           global.pendingPairingCode = null;
-          reconnectAttempts = 0; // Reset reconnect attempts
+          reconnectAttempts = 0;
 
-          // Simpan metadata session (tanpa OTP, hanya phone number)
           if (phoneNumber) {
-            saveSession(phoneNumber, null); // OTP tidak perlu
+            saveSession(phoneNumber);
           }
           console.log("✅ WhatsApp Connected!");
           resolve(sock);
@@ -82,7 +82,6 @@ export async function connectToWhatsApp(phoneNumber) {
         console.log("❌ Connection closed. Status code:", statusCode);
 
         if (shouldReconnect && !resolved) {
-          // Jika belum resolve (berarti gagal saat pairing), reject saja
           if (!resolved) {
             resolved = true;
             clearTimeout(timeoutId);
@@ -93,42 +92,45 @@ export async function connectToWhatsApp(phoneNumber) {
             );
           }
         } else if (shouldReconnect && resolved) {
-          // Koneksi yang sudah berhasil tiba-tiba putus, lakukan reconnect dengan backoff
           scheduleReconnect();
         } else {
           // 401 Unauthorized, hapus session dan tidak usah reconnect
           console.log("Session invalid, clearing auth folder...");
           await clearSession();
-          await rm("./auth_info", { recursive: true, force: true }).catch(
-            () => {},
-          );
+          try {
+            await rm("./auth_info", { recursive: true, force: true });
+          } catch (err) {
+            console.error("Error removing auth_info:", err);
+          }
           global.sock = null;
           global.isConnected = false;
+          global.pendingPairingCode = null;
         }
       }
     });
 
-    // Jika sudah memiliki credentials yang valid, tidak perlu pairing code
-    // Tapi jika belum, kita panggil requestPairingCode untuk memulai pairing
-    // Periksa apakah sudah terdaftar
-    const isRegistered = sock.authState.creds.registered === true; // properti registered di creds?
+    // Cek apakah sudah memiliki credentials yang valid
+    const isRegistered =
+      sock.authState?.creds?.registered === true || sock.user !== undefined;
+
     if (!isRegistered && phoneNumber) {
-      try {
-        // Minta pairing code secara manual (opsional, karena event pairing-code akan tetap keluar)
-        await sock.requestPairingCode(phoneNumber);
-        console.log("Requested pairing code for", phoneNumber);
-      } catch (err) {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timeoutId);
-          reject(err);
+      // Tunggu sebentar agar websocket siap sebelum minta pairing code
+      setTimeout(async () => {
+        try {
+          await sock.requestPairingCode(phoneNumber);
+          console.log("Requested pairing code for", phoneNumber);
+        } catch (err) {
+          console.error("Error requesting pairing code:", err);
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutId);
+            reject(err);
+          }
         }
-      }
+      }, 2000); // Delay 2 detik untuk menghindari error 428
     } else if (isRegistered) {
-      // Sudah punya session, tunggu koneksi open
       console.log("Existing session found, waiting for connection...");
     } else {
-      // Tidak ada phoneNumber, tidak bisa pairing
       if (!resolved) {
         resolved = true;
         clearTimeout(timeoutId);
@@ -142,7 +144,7 @@ function scheduleReconnect() {
   if (reconnectTimeout) clearTimeout(reconnectTimeout);
 
   const maxAttempts = 10;
-  const baseDelay = 5000; // 5 detik
+  const baseDelay = 5000;
   const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts), 60000);
 
   if (reconnectAttempts >= maxAttempts) {
@@ -172,7 +174,6 @@ function scheduleReconnect() {
   }, delay);
 }
 
-// Auto-reconnect saat server start
 export async function autoReconnect() {
   const session = getSession();
   if (session && session.phone) {
@@ -190,7 +191,7 @@ export async function autoReconnect() {
   return false;
 }
 
-// Middleware & server
+// Express setup
 app.use(cors());
 app.use(express.json());
 
