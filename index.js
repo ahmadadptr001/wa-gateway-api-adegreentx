@@ -95,11 +95,7 @@ async function startWhatsApp(phoneNumber, customCode, retryCount = 0) {
             );
           }, 5000);
         } else {
-          console.log("🚫 Logged out, hapus data auth.");
-          await rm("./auth_info", { recursive: true, force: true }).catch(
-            () => {},
-          );
-          clearSession();
+          console.log("🚫 Logged out");
         }
       }
     });

@@ -58,105 +58,113 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 === ./controllers/wa.controller.js ===
-import { connectToWhatsApp } from "../index.js";
+import { startWhatsApp } from "../index.js";
 import { rm } from "node:fs/promises";
 import { clearSession } from "../sessionManager.js";
 
+let pairingInProgress = false;
+
 export const sendMessage = async (req, res) => {
-  let globalSock = global.sock;
-
   try {
-    const { number, message } = req.query;
-
+    const { number, message } = req.body;
     if (!number || !message) {
-      return res.status(400).json({
-        success: false,
-        message: "Parameter 'number' and 'message' required",
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "Parameter 'number' and 'message' required",
+        });
     }
-
-    if (!globalSock) {
-      return res.status(503).json({
-        success: false,
-        message: "WhatsApp socket not initialized. Call /registered first.",
-      });
+    if (!global.sock || !global.isConnected) {
+      return res
+        .status(503)
+        .json({ success: false, message: "WhatsApp not connected" });
     }
-
-    // Format nomor: hapus karakter non-digit, tambahkan @s.whatsapp.net
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-
-    await globalSock.sendMessage(jid, { text: message });
-
-    res
-      .status(200)
-      .json({ success: true, message: "Message sent successfully" });
+    await global.sock.sendMessage(jid, { text: message });
+    res.status(200).json({ success: true, message: "Message sent" });
   } catch (error) {
-    console.error("Error sending message:", error);
-    res.status(500).json({ success: false, message: "Failed to send message" });
+    console.error("Send error:", error);
+    res.status(500).json({ success: false, message: "Failed to send" });
   }
 };
 
 export const getStatus = async (req, res) => {
-  let globalSock = global.sock;
-  console.log("[LOG SOCKET] state: ", globalSock);
-  try {
-    let isConnected = globalSock?.authState?.registered;
-    z;
-    // Cara 2: Cek dari WebSocket readyState (0 = CONNECTING, 1 = OPEN, 2 = CLOSING, 3 = CLOSED)
-    res.status(200).json({
-      success: true,
-      connected: isConnected ? true : false,
-      data: isConnected
-        ? {
-            id: globalSock.user?.id || null,
-            name: globalSock.user?.name || globalSock.user?.pushName || null,
-          }
-        : null,
-    });
-  } catch (error) {
-    console.error("Error getting status:", error);
-    res.status(500).json({ success: false, message: "Failed to get status" });
-  }
+  res.status(200).json({
+    success: true,
+    connected: global.isConnected === true,
+    data: global.sock?.user
+      ? {
+          id: global.sock.user.id,
+          name: global.sock.user.name || global.sock.user.pushName,
+        }
+      : null,
+  });
 };
 
 export const checkRegistered = async (req, res) => {
   try {
     const { phoneNumber, otpCodeManual } = req.body;
-
     if (!phoneNumber || !otpCodeManual) {
-      return res.status(400).json({
-        success: false,
-        message: " 'phoneNumber and 'otpCodeManual' required",
-      });
+      return res
+        .status(400)
+        .json({
+          success: false,
+          message: "phoneNumber and otpCodeManual required",
+        });
     }
-
-    await rm("./auth_info", { recursive: true, force: true });
-    clearSession(); // Hapus session lama
-
-    console.log("nomor hp:" + phoneNumber);
-    console.log("kode otp:", otpCodeManual);
-
-    try {
-      await connectToWhatsApp(phoneNumber, otpCodeManual);
-      res.status(200).json({
-        success: true,
-        registered: true,
-        message:
-          "Device initialization started. Check pairing code in server logs.",
-      });
-    } catch (err) {
-      res.status(400).json({
-        success: false,
-        registered: false,
-        message: err.message,
-      });
+    if (pairingInProgress) {
+      return res
+        .status(409)
+        .json({ success: false, message: "Pairing already in progress" });
     }
-  } catch (error) {
-    console.error("Error checking registration:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to initialize: " + error.message,
+    pairingInProgress = true;
+
+    // Reset state
+    global.sock = null;
+    global.isConnected = false;
+
+    // Hapus auth lama untuk fresh start
+    await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
+    clearSession();
+
+    console.log(
+      `Memulai pairing untuk ${phoneNumber} dengan kode: ${otpCodeManual}`,
+    );
+    // Jalankan startWhatsApp tanpa await (biar background) tapi kita tetap respon cepat
+    startWhatsApp(phoneNumber, otpCodeManual)
+      .catch((err) => {
+        console.error("Pairing error:", err);
+        pairingInProgress = false;
+      })
+      .finally(() => {
+        // Beri jeda agar tidak double start
+        setTimeout(() => {
+          pairingInProgress = false;
+        }, 5000);
+      });
+
+    res.status(200).json({
+      success: true,
+      message: `Kode pairing "${otpCodeManual}" dikirim. Buka WhatsApp -> Settings -> Linked Devices -> Link a Device -> Link with phone number, masukkan kode tersebut.`,
     });
+  } catch (error) {
+    console.error("Error:", error);
+    pairingInProgress = false;
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const logout = async (req, res) => {
+  try {
+    global.sock = null;
+    global.isConnected = false;
+    pairingInProgress = false;
+    await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
+    clearSession();
+    res.status(200).json({ success: true, message: "Logged out" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
@@ -164,131 +172,144 @@ export const checkRegistered = async (req, res) => {
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  DisconnectReason,
 } from "@whiskeysockets/baileys";
 import waRoutes from "./routes/wa.route.js";
 import express from "express";
 import cors from "cors";
 import P from "pino";
 import { saveSession, getSession, clearSession } from "./sessionManager.js";
+import { rm } from "node:fs/promises";
 
 const PORT = process.env.PORT || 4000;
 const app = express();
-
 const logger = P({ level: "silent" });
+
+// Global hanya untuk menyimpan socket yang aktif (dipakai route sendMessage)
+global.sock = null;
+global.isConnected = false;
+let isStarting = false; // mencegah multiple start
+
+// Fungsi wait
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export async function connectToWhatsApp(phoneNumber, otpCodeManual) {
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-  const { version } = await fetchLatestBaileysVersion();
-  logger.info(`Using WA version v${version.join(".")}`);
+// Fungsi utama start WhatsApp - diadopsi dari kode user yang berhasil
+async function startWhatsApp(phoneNumber, customCode, retryCount = 0) {
+  if (isStarting) {
+    console.log("⏳ Proses start sedang berjalan, abaikan...");
+    return;
+  }
+  isStarting = true;
+  try {
+    // Hapus auth lama untuk fresh start (opsional, bisa dihapus jika ingin retain)
+    await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
+    clearSession();
 
-  const socket = makeWASocket({
-    version,
-    logger,
-    auth: state,
-    browser: ["Ubuntu", "Chrome", "20.0.0"],
-  });
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`📱 WA version: ${version.join(".")} (latest: ${isLatest})`);
 
-  state.sock = socket;
+    const sock = makeWASocket({
+      logger: P({ level: "silent" }),
+      version,
+      auth: state,
+      browser: ["Ubuntu", "Chrome", "120.0"],
+    });
 
-  console.log("Connecting to WhatsApp...");
-
-  if (!socket.authState.creds.registered) {
-    try {
+    // 🔥 Kunci sukses: delay 5 detik sebelum minta pairing code (seperti contoh user)
+    if (!sock.authState.creds?.registered) {
+      console.log(
+        "⏳ Menunggu 5 detik sebelum mengirim kode pairing custom...",
+      );
       await wait(5000);
-      const code = await socket.requestPairingCode(phoneNumber, otpCodeManual);
-      console.log("Menunggu verifikasi otp:", code);
-    } catch (err) {
-      console.error("Error request pairing code:", err);
-      throw new Error(err);
-      return;
-    }
-  }
-
-  socket.ev.on("creds.update", saveCreds);
-  socket.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
-
-    global.sock = socket;
-
-    if (connection === "open") {
-      console.log("✅ WhatsApp Berhasil Tertaut!");
-      // Simpan socket ke global agar bisa diakses dari controller
-      if (!global.sock) {
-        global.sock = socket;
-      }
-      global.isRegistered = true;
-
-      console.log("[SOCKET LOG] state user:", socket.user);
-      // Simpan session saat berhasil terhubung
-      if (phoneNumber && otpCodeManual) {
-        saveSession(phoneNumber, otpCodeManual);
-      }
-    }
-
-    if (connection === "close") {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
-      console.log("❌ Koneksi terputus karena:", lastDisconnect?.error);
-
-      if (shouldReconnect) {
-        global.sock = socket;
-        global.isRegistered = true;
-        global.phone = phoneNumber;
-        global.otp = otpCodeManual;
-        console.log("🔄 Menghubungkan ulang...");
-        connectToWhatsApp(phoneNumber, otpCodeManual);
-      } else {
+      try {
+        const result = await sock.requestPairingCode(phoneNumber, customCode);
         console.log(
-          "🚫 Sesi tidak valid. Silakan hapus folder auth dan scan ulang.",
+          `✅ Kode custom "${customCode}" berhasil dikirim ke WhatsApp. Result: ${result || "tidak ada"}`,
         );
-        clearSession();
+      } catch (err) {
+        console.error("❌ Gagal mengirim kode custom:", err);
+        throw err;
       }
+    } else {
+      console.log("🔐 Sudah terdaftar, menunggu koneksi...");
     }
-  });
-}
 
-/**
- * Auto-reconnect menggunakan credentials yang tersimpan
- */
-export async function autoReconnect() {
-  const session = getSession();
-  if (session) {
-    console.log("[AUTO] Ditemukan session tersimpan, mencoba reconnect...");
-    try {
-      global.phone = session.phone;
-      global.otp = session.otp;
-      global.sock = session.sock;
-      // connectToWhatsApp akan set global.sock saat koneksi berhasil
-      await connectToWhatsApp(session.phone, session.otp);
-      return true;
-    } catch (err) {
-      console.error("[AUTO] Gagal reconnect:", err);
-      clearSession();
+    sock.ev.on("creds.update", saveCreds);
+
+    // Event connection.update diadopsi dari contoh user (pakai DisconnectReason)
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === "open") {
+        console.log("✅ WhatsApp berhasil terhubung!");
+        global.sock = sock;
+        global.isConnected = true;
+        // Simpan session (pairing code disimpan untuk auto reconnect)
+        saveSession(phoneNumber, customCode);
+        isStarting = false;
+      }
+
+      if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        console.log(`❌ Koneksi tertutup. Kode: ${statusCode}`);
+        global.isConnected = false;
+        global.sock = null;
+        isStarting = false;
+
+        // Gunakan DisconnectReason untuk menentukan reconnect (seperti contoh user)
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        if (shouldReconnect) {
+          console.log("🔄 Mencoba menyambung ulang dalam 5 detik...");
+          setTimeout(() => {
+            startWhatsApp(phoneNumber, customCode, retryCount + 1).catch(
+              console.error,
+            );
+          }, 5000);
+        } else {
+          console.log("🚫 Logged out, hapus data auth.");
+          await rm("./auth_info", { recursive: true, force: true }).catch(
+            () => {},
+          );
+          clearSession();
+        }
+      }
+    });
+
+    // Optional: jika ingin menyimpan pesan masuk (bisa dihapus jika tidak perlu)
+    // Tidak mempengaruhi pairing.
+  } catch (err) {
+    console.error("Gagal startWhatsApp:", err);
+    isStarting = false;
+    // Jika gagal, retry lagi setelah 5 detik (maks 3 kali)
+    if (retryCount < 3) {
+      console.log(
+        `🔄 Retry startWhatsApp (${retryCount + 1}/3) setelah 5 detik...`,
+      );
+      setTimeout(
+        () => startWhatsApp(phoneNumber, customCode, retryCount + 1),
+        5000,
+      );
     }
   }
-  return false;
 }
 
+// Auto-start jika ada session tersimpan (sama seperti autoReconnect sebelumnya)
+const session = getSession();
+if (session?.phone && session?.otp) {
+  console.log("🔄 Auto start dengan session tersimpan");
+  startWhatsApp(session.phone, session.otp).catch(console.error);
+}
+
+// Express setup
 app.use(cors());
 app.use(express.json());
-
-app.get("/", (req, res) => {
-  res.status(200).json({ success: true, message: "Welcome to WA Gateway API" });
-});
-
+app.get("/", (req, res) =>
+  res.json({ success: true, message: "WA Gateway API" }),
+);
 app.use("/api/wa", waRoutes);
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
-// Auto-reconnect saat server restart
-autoReconnect().then((success) => {
-  if (success) {
-    console.log("[AUTO] Reconnect berhasil!");
-  } else {
-    console.log("[AUTO] Tidak ada session tersimpan, perlu register manual");
-  }
-});
+export { startWhatsApp }; // diekspor untuk digunakan di controller
 
 === ./package.json ===
 {
@@ -309,7 +330,8 @@ autoReconnect().then((success) => {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "pino": "^10.3.1"
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0"
   }
 }
 
@@ -320,11 +342,13 @@ import {
   sendMessage,
   getStatus,
   checkRegistered,
+  logout,
 } from "../controllers/wa.controller.js";
 
-router.get("/send-message", sendMessage);
+router.post("/send-message", sendMessage);
 router.get("/status", getStatus);
 router.post("/registered", checkRegistered);
+router.post("/logout", logout);
 
 export default router;
 
@@ -340,9 +364,6 @@ import path from "path";
 
 const SESSION_FILE = path.join(process.cwd(), "session_data.json");
 
-/**
- * Simpan metadata session ke file
- */
 export function saveSession(phoneNumber, otpCodeManual) {
   const data = {
     phone: phoneNumber,
@@ -350,36 +371,21 @@ export function saveSession(phoneNumber, otpCodeManual) {
     savedAt: new Date().toISOString(),
   };
   fs.writeFileSync(SESSION_FILE, JSON.stringify(data, null, 2));
-  console.log("[SESSION] Metadata saved!");
+  console.log("[SESSION] Tersimpan:", phoneNumber);
 }
 
-/**
- * Ambil metadata session dari file
- */
 export function getSession() {
   try {
     if (fs.existsSync(SESSION_FILE)) {
-      const data = JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
-      console.log("[SESSION] Loaded session:", data);
-      return data;
+      return JSON.parse(fs.readFileSync(SESSION_FILE, "utf-8"));
     }
-  } catch (err) {
-    console.error("[SESSION] Error loading session:", err);
-  }
+  } catch (err) {}
   return null;
 }
 
-/**
- * Hapus session saat logout/reset
- */
 export function clearSession() {
   try {
-    if (fs.existsSync(SESSION_FILE)) {
-      fs.unlinkSync(SESSION_FILE);
-      console.log("[SESSION] Session cleared");
-    }
-  } catch (err) {
-    console.error("[SESSION] Error clearing session:", err);
-  }
+    if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE);
+  } catch (err) {}
 }
 
