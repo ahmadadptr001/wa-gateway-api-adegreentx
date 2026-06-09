@@ -16,8 +16,7 @@ const logger = P({ level: "silent" });
 // Global state
 global.sock = null;
 global.isConnected = false;
-global.pendingPairingCode = null;
-global.pendingQR = null;
+global.pendingPairingCode = null; // hanya pairing code
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
 let isPairing = false;
@@ -40,7 +39,7 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
       version,
       logger,
       auth: state,
-      browser: ["Ubuntu", "Chrome", "120.0"], // sesuai permintaan user
+      browser: ["Ubuntu", "Chrome", "120.0"], // user agent umum
       connectTimeoutMs: 30000,
       defaultQueryTimeoutMs: 30000,
       keepAliveIntervalMs: 30000,
@@ -58,20 +57,12 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, pairingCode, qr } = update;
+      const { connection, lastDisconnect, pairingCode } = update;
 
-      // Tangkap pairing code (prioritas)
+      // Hanya tangkap pairing code
       if (pairingCode) {
         console.log("✅ Pairing code received:", pairingCode);
         global.pendingPairingCode = pairingCode;
-        global.pendingQR = null; // hapus QR jika ada
-      }
-
-      // Tangkap QR code (fallback)
-      if (qr) {
-        console.log("📱 QR code received, length:", qr.length);
-        global.pendingQR = qr;
-        global.pendingPairingCode = null; // hapus pairing code jika ada
       }
 
       if (connection === "open") {
@@ -81,7 +72,6 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           global.sock = sock;
           global.isConnected = true;
           global.pendingPairingCode = null;
-          global.pendingQR = null;
           reconnectAttempts = 0;
           if (phoneNumber) saveSession(phoneNumber);
           console.log("✅ WhatsApp Connected!");
@@ -109,7 +99,6 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           global.sock = null;
           global.isConnected = false;
           global.pendingPairingCode = null;
-          global.pendingQR = null;
           isPairing = false;
 
           if (retryCount < MAX_RETRY) {
@@ -146,23 +135,23 @@ export async function connectToWhatsApp(phoneNumber, retryCount = 0) {
           global.sock = null;
           global.isConnected = false;
           global.pendingPairingCode = null;
-          global.pendingQR = null;
           isPairing = false;
           if (!resolved) reject(new Error("Unauthorized"));
         }
       }
     });
 
+    // Minta pairing code
     const isRegistered =
       sock.authState?.creds?.registered === true || sock.user !== undefined;
     if (!isRegistered && phoneNumber) {
       console.log("📱 Requesting pairing code for", phoneNumber);
       setTimeout(async () => {
         try {
-          await sock.requestPairingCode(phoneNumber);
+          await sock.requestPairingCode(phoneNumber); // hanya satu argumen
           console.log("✅ Pairing code request sent");
         } catch (err) {
-          console.error("❌ Failed request pairing code:", err);
+          console.error("❌ Failed to request pairing code:", err);
           if (!resolved) {
             resolved = true;
             clearTimeout(timeoutId);

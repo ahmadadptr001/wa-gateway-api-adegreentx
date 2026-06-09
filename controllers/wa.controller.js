@@ -33,17 +33,15 @@ export const sendMessage = async (req, res) => {
 export const getStatus = async (req, res) => {
   const isConnected = global.isConnected === true;
   const pairingCode = global.pendingPairingCode || null;
-  const qrCode = global.pendingQR || null;
   res.status(200).json({
     success: true,
     connected: isConnected,
-    pairingCode: pairingCode,
-    qrCode: qrCode,
+    pairingCode: pairingCode, // hanya ini yang dikirim
     data:
       isConnected && global.sock?.user
         ? {
-            id: global.sock.user.id || null,
-            name: global.sock.user.name || global.sock.user.pushName || null,
+            id: global.sock.user.id,
+            name: global.sock.user.name || global.sock.user.pushName,
           }
         : null,
   });
@@ -67,10 +65,9 @@ export const checkRegistered = async (req, res) => {
     global.sock = null;
     global.isConnected = false;
     global.pendingPairingCode = null;
-    global.pendingQR = null;
     pairingInProgress = true;
 
-    // Hapus auth lama
+    // Hapus auth lama (fresh start)
     try {
       await rm("./auth_info", { recursive: true, force: true });
     } catch (err) {}
@@ -86,7 +83,7 @@ export const checkRegistered = async (req, res) => {
       .status(200)
       .json({
         success: true,
-        message: "Pairing initiated. Poll /status for code/QR.",
+        message: "Pairing initiated. Poll /status for pairing code.",
       });
   } catch (error) {
     console.error("Error start pairing:", error);
@@ -100,7 +97,6 @@ export const logout = async (req, res) => {
     global.sock = null;
     global.isConnected = false;
     global.pendingPairingCode = null;
-    global.pendingQR = null;
     pairingInProgress = false;
     await rm("./auth_info", { recursive: true, force: true });
     clearSession();
