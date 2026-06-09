@@ -8,24 +8,21 @@ import express from "express";
 import cors from "cors";
 import P from "pino";
 import { saveSession, getSession, clearSession } from "./sessionManager.js";
-import { authenticate } from "./middleware/auth.js";
+import { rm } from "node:fs/promises";
 
 const PORT = process.env.PORT || 4000;
 const app = express();
 
-// Global untuk socket aktif
 global.sock = null;
 global.isConnected = false;
 
-let isStarting = false; // mencegah multiple start
-let currentRetryCount = 0;
+let isStarting = false;
 let currentPhone = null;
 let currentCustomCode = null;
-let isPairingMode = false; // apakah sedang dalam mode pairing (butuh request code)
+let isPairingMode = false;
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Fungsi utama start WhatsApp (bisa untuk pairing atau reconnect biasa)
 export async function startWhatsApp(
   phoneNumber,
   customCode,
@@ -42,26 +39,22 @@ export async function startWhatsApp(
   isPairingMode = pairingMode;
 
   try {
-    // Gunakan multi file auth state tanpa menghapus folder
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`📱 WA version: ${version.join(".")} (latest: ${isLatest})`);
 
     const sock = makeWASocket({
-      logger: P({ level: "info" }), // ubah ke info untuk debugging
+      logger: P({ level: "info" }),
       version,
       auth: state,
-      browser: ["Ubuntu", "Chrome", "20.0.0"], // sama seperti contoh yang berhasil
+      browser: ["Ubuntu", "Chrome", "20.0.0"],
     });
 
-    // Event: creds.update
     sock.ev.on("creds.update", saveCreds);
 
-    // Event: connection.update
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, pairingCode } = update;
 
-      // Jika ada pairingCode dari event (kode default 8 digit), log saja
       if (pairingCode) {
         console.log(`📟 Kode pairing (default): ${pairingCode}`);
       }
@@ -70,7 +63,6 @@ export async function startWhatsApp(
         console.log("✅ WhatsApp berhasil terhubung!");
         global.sock = sock;
         global.isConnected = true;
-        // Simpan session (nomor & kode, meski tidak digunakan untuk auth)
         await saveSession(currentPhone, currentCustomCode);
         isStarting = false;
         currentRetryCount = 0;
@@ -85,14 +77,12 @@ export async function startWhatsApp(
         global.isConnected = false;
         global.sock = null;
 
-        // Handle restartRequired (515) - ini bukan error, tapi perintah restart dari WA
+        // 🔥 Tangani restartRequired (515) - bukan error, restart koneksi tanpa pairing
         if (statusCode === DisconnectReason.restartRequired) {
           console.log(
             "🔄 WhatsApp meminta restart (515), memulai ulang koneksi...",
           );
-          // Jangan set isStarting = false dulu, biarkan reconnect tanpa pairing mode
-          isStarting = false; // agar bisa start ulang
-          // Panggil startWhatsApp ulang dengan pairingMode = false
+          isStarting = false;
           startWhatsApp(
             currentPhone,
             currentCustomCode,
@@ -102,7 +92,6 @@ export async function startWhatsApp(
           return;
         }
 
-        // Untuk loggedOut, hapus data auth
         if (statusCode === DisconnectReason.loggedOut) {
           console.log("🚫 Logged out, hapus data auth.");
           await rm("./auth_info", { recursive: true, force: true }).catch(
@@ -113,34 +102,26 @@ export async function startWhatsApp(
           return;
         }
 
-        // Selain 515 dan loggedOut, reconnect biasa dengan jeda
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        if (shouldReconnect) {
-          console.log("🔄 Mencoba menyambung ulang dalam 5 detik...");
-          setTimeout(() => {
-            startWhatsApp(
-              currentPhone,
-              currentCustomCode,
-              false,
-              retryCount + 1,
-            ).catch(console.error);
-          }, 5000);
-        } else {
-          isStarting = false;
-        }
+        // Reconnect biasa untuk error lain
+        console.log("🔄 Mencoba menyambung ulang dalam 5 detik...");
+        setTimeout(() => {
+          startWhatsApp(
+            currentPhone,
+            currentCustomCode,
+            false,
+            retryCount + 1,
+          ).catch(console.error);
+        }, 5000);
       }
     });
 
-    // Jika mode pairing dan belum terdaftar, minta pairing code
-    // Kita gunakan pendekatan: tunggu hingga koneksi dalam keadaan 'connecting' atau setelah delay
-    // Untuk keandalan, kita tunggu 5 detik lalu request (seperti contoh TS yang berhasil)
+    // Jika mode pairing dan belum terdaftar, minta pairing code setelah delay
     if (isPairingMode && !sock.authState.creds?.registered) {
       console.log(
         "⏳ Menunggu 5 detik sebelum mengirim kode pairing custom...",
       );
       await wait(5000);
       try {
-        // Pastikan sock masih valid
         const result = await sock.requestPairingCode(
           currentPhone,
           currentCustomCode,
@@ -150,7 +131,6 @@ export async function startWhatsApp(
         );
       } catch (err) {
         console.error("❌ Gagal mengirim kode custom:", err);
-        // Jangan throw, biarkan connection.update menangani close
       }
     } else if (!isPairingMode) {
       console.log(
@@ -161,9 +141,7 @@ export async function startWhatsApp(
     console.error("Gagal startWhatsApp:", err);
     isStarting = false;
     if (retryCount < 3) {
-      console.log(
-        `🔄 Retry startWhatsApp (${retryCount + 1}/3) setelah 5 detik...`,
-      );
+      console.log(`🔄 Retry (${retryCount + 1}/3) setelah 5 detik...`);
       setTimeout(
         () =>
           startWhatsApp(
@@ -178,29 +156,20 @@ export async function startWhatsApp(
   }
 }
 
-// Auto-start jika ada session tersimpan (tanpa pairing mode)
+// Auto-start jika ada session tersimpan
 const session = await getSession();
 if (session?.phone && session?.otp) {
   console.log("🔄 Auto start dengan session tersimpan (tanpa pairing)");
   startWhatsApp(session.phone, session.otp, false).catch(console.error);
 }
 
-// Express setup
+// Express setup - semua endpoint publik
 app.use(cors());
 app.use(express.json());
 
-// Public endpoint (boleh tanpa auth)
 app.get("/", (req, res) =>
   res.json({ success: true, message: "WA Gateway API" }),
 );
-app.get("/api/wa/status", async (req, res) => {
-  // status bisa publik
-  const { getStatus } = await import("./controllers/wa.controller.js");
-  return getStatus(req, res);
-});
-
-// Endpoint yang memerlukan autentikasi
-app.use("/api/wa", authenticate);
-app.use("/api/wa", waRoutes);
+app.use("/api/wa", waRoutes); // semua route wa tanpa auth
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
