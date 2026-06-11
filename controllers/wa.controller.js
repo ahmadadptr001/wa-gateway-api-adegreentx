@@ -4,6 +4,116 @@ import { clearSession } from "../sessionManager.js";
 
 let pairingInProgress = false;
 
+// ========== RATE LIMITING PER NOMOR + IP ==========
+const otpRateLimit = new Map(); // key: "number|ip", value: { count, firstRequestTime }
+const OTP_LIMIT_PER_NUMBER = 3;
+const OTP_TIME_WINDOW_MS = 10 * 60 * 1000; // 10 menit
+
+// ========== RATE LIMITING GLOBAL ==========
+let globalOtpCount = 0;
+let globalResetTime = Date.now() + 60 * 1000; // reset setiap 1 menit
+const MAX_GLOBAL_OTP_PER_MINUTE = 30; // maksimal 30 OTP per menit
+
+// Bersihkan data rate limit per nomor secara berkala
+setInterval(
+  () => {
+    const now = Date.now();
+    for (const [key, data] of otpRateLimit.entries()) {
+      if (now - data.firstRequestTime > OTP_TIME_WINDOW_MS) {
+        otpRateLimit.delete(key);
+      }
+    }
+  },
+  5 * 60 * 1000,
+);
+
+// Reset global counter setiap menit
+setInterval(() => {
+  globalOtpCount = 0;
+  globalResetTime = Date.now() + 60 * 1000;
+}, 60 * 1000);
+
+// ========== FUNGSI PENGECEK KONEKSI DENGAN PESAN MAINTENANCE ==========
+const checkWaConnection = (res) => {
+  if (!global.sock || !global.isConnected) {
+    res.status(503).json({
+      success: false,
+      message: "Sistem sedang maintenance, coba lagi nanti.",
+    });
+    return false;
+  }
+  return true;
+};
+
+// ========== ENDPOINT SEND OTP ==========
+export const sendOtp = async (req, res) => {
+  try {
+    const { number, message } = req.body;
+    if (!number || !message) {
+      return res.status(400).json({
+        success: false,
+        message: "Parameter 'number' and 'message' (OTP) required",
+      });
+    }
+
+    // --- Global rate limiting ---
+    if (globalOtpCount >= MAX_GLOBAL_OTP_PER_MINUTE) {
+      return res.status(429).json({
+        success: false,
+        message: "Server sedang sibuk, coba lagi dalam 1 menit.",
+      });
+    }
+
+    // --- Per-nomor + IP rate limiting ---
+    const clientIp = req.ip || req.connection.remoteAddress;
+    const rateKey = `${number}|${clientIp}`;
+    const now = Date.now();
+    const rateData = otpRateLimit.get(rateKey);
+
+    if (rateData) {
+      if (now - rateData.firstRequestTime <= OTP_TIME_WINDOW_MS) {
+        if (rateData.count >= OTP_LIMIT_PER_NUMBER) {
+          const remainSeconds = Math.ceil(
+            (OTP_TIME_WINDOW_MS - (now - rateData.firstRequestTime)) / 1000,
+          );
+          return res.status(429).json({
+            success: false,
+            message: `Terlalu banyak permintaan OTP. Coba lagi setelah ${remainSeconds} detik.`,
+          });
+        } else {
+          rateData.count++;
+          otpRateLimit.set(rateKey, rateData);
+        }
+      } else {
+        otpRateLimit.set(rateKey, { count: 1, firstRequestTime: now });
+      }
+    } else {
+      otpRateLimit.set(rateKey, { count: 1, firstRequestTime: now });
+    }
+
+    // Increment global counter
+    globalOtpCount++;
+
+    // --- Cek koneksi WhatsApp (dengan pesan maintenance) ---
+    if (!checkWaConnection(res)) return;
+
+    const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
+    await global.sock.sendMessage(jid, { text: message });
+
+    res.status(200).json({
+      success: true,
+      message: "Kode OTP berhasil dikirim",
+    });
+  } catch (error) {
+    console.error("Gagal mengirim OTP:", error);
+    res.status(500).json({
+      success: false,
+      message: "Gagal mengirim OTP",
+    });
+  }
+};
+
+// ========== ENDPOINT SEND MESSAGE BIASA ==========
 export const sendMessage = async (req, res) => {
   try {
     const { number, message } = req.body;
@@ -13,11 +123,10 @@ export const sendMessage = async (req, res) => {
         message: "Parameter 'number' and 'message' required",
       });
     }
-    if (!global.sock || !global.isConnected) {
-      return res
-        .status(503)
-        .json({ success: false, message: "WhatsApp not connected" });
-    }
+
+    // Cek koneksi WhatsApp dengan pesan maintenance
+    if (!checkWaConnection(res)) return;
+
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
     await global.sock.sendMessage(jid, { text: message });
     res.status(200).json({ success: true, message: "Message sent" });
@@ -27,6 +136,7 @@ export const sendMessage = async (req, res) => {
   }
 };
 
+// ========== CEK STATUS KONEKSI ==========
 export const getStatus = async (req, res) => {
   res.status(200).json({
     success: true,
@@ -40,6 +150,7 @@ export const getStatus = async (req, res) => {
   });
 };
 
+// ========== PAIRING (TIDAK PERLU PENGECEKAN MAINTENANCE) ==========
 export const checkRegistered = async (req, res) => {
   try {
     const { phoneNumber, otpCodeManual } = req.body;
@@ -61,13 +172,10 @@ export const checkRegistered = async (req, res) => {
     global.sock = null;
     global.isConnected = false;
 
-    // JANGAN hapus auth_info di sini! Biarkan startWhatsApp yang mengelola
-
     console.log(
       `Memulai pairing untuk ${phoneNumber} dengan kode: ${otpCodeManual}`,
     );
 
-    // Jalankan startWhatsApp dengan flag pairing = true
     startWhatsApp(phoneNumber, otpCodeManual, true)
       .catch((err) => {
         console.error("Pairing error:", err);
@@ -90,12 +198,12 @@ export const checkRegistered = async (req, res) => {
   }
 };
 
+// ========== LOGOUT ==========
 export const logout = async (req, res) => {
   try {
     global.sock = null;
     global.isConnected = false;
     pairingInProgress = false;
-    // Hapus auth folder hanya saat logout manual
     await rm("./auth_info", { recursive: true, force: true }).catch(() => {});
     await clearSession();
     res.status(200).json({ success: true, message: "Logged out" });

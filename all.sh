@@ -20,6 +20,7 @@
     ! -name "*.jpg" \
     ! -name "README.md" \
     ! -name "AGENTS.md" \
+    ! -name ".gitignore" \
     ! -name "ringkasan.txt" \
     ! -name "ecosystem.config.cjs" \
     ! -name "tsconfig.json" \
