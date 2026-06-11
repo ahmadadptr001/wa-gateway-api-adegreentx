@@ -1,6 +1,8 @@
 import { startWhatsApp } from "../index.js";
 import { rm } from "node:fs/promises";
 import { clearSession } from "../sessionManager.js";
+import path from "path";
+import fs from "fs/promises";
 
 let pairingInProgress = false;
 
@@ -33,7 +35,7 @@ setInterval(() => {
   globalResetTime = Date.now() + 60 * 1000;
 }, 60 * 1000);
 
-// ========== FUNGSI PENGECEK KONEKSI DENGAN PESAN MAINTENANCE ==========
+// ========== FUNGSI PENGECEK KONEKSI ==========
 const checkWaConnection = (res) => {
   if (!global.sock || !global.isConnected) {
     res.status(503).json({
@@ -43,6 +45,39 @@ const checkWaConnection = (res) => {
     return false;
   }
   return true;
+};
+
+// ========== FORMAT PESAN OTP ==========
+const formatOtpMessage = (otpCode) => {
+  return `🔐 *KODE OTP ANDA: ${otpCode}*
+
+Halo, permintaan verifikasi dari *Ade Green TX* sedang diproses.
+
+⚠️ *JANGAN BERIKAN KODE INI KEPADA SIAPA PUN*, termasuk yang mengaku sebagai petugas Ade Green TX.
+
+Kode ini hanya untuk verifikasi login / reset password Anda.
+
+Abaikan pesan ini jika Anda tidak merasa melakukan permintaan.
+
+✅ *Ade Green TX* – Jaga kerahasiaan akun Anda.`;
+};
+
+// ========== KIRIM GAMBAR OTP (jika ada) ==========
+const sendOtpImage = async (jid) => {
+  const imagePath = path.join(
+    process.cwd(),
+    "public",
+    "images",
+    "otp-banner.png",
+  );
+  try {
+    await fs.access(imagePath);
+    const imageBuffer = await fs.readFile(imagePath);
+    await global.sock.sendMessage(jid, { image: imageBuffer, caption: " " });
+    console.log("✅ Gambar OTP terkirim");
+  } catch (err) {
+    console.log("⚠️ Gambar OTP tidak ditemukan, lanjut tanpa gambar");
+  }
 };
 
 // ========== ENDPOINT SEND OTP ==========
@@ -94,11 +129,19 @@ export const sendOtp = async (req, res) => {
     // Increment global counter
     globalOtpCount++;
 
-    // --- Cek koneksi WhatsApp (dengan pesan maintenance) ---
+    // --- Cek koneksi WhatsApp ---
     if (!checkWaConnection(res)) return;
 
+    // Bersihkan nomor telepon
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-    await global.sock.sendMessage(jid, { text: message });
+    const otpCode = message; // asumsi message adalah kode OTP
+
+    // Kirim teks OTP (kode di awal)
+    const formattedText = formatOtpMessage(otpCode);
+    await global.sock.sendMessage(jid, { text: formattedText });
+
+    // Kirim gambar pendukung (jika ada)
+    await sendOtpImage(jid);
 
     res.status(200).json({
       success: true,
@@ -113,7 +156,7 @@ export const sendOtp = async (req, res) => {
   }
 };
 
-// ========== ENDPOINT SEND MESSAGE BIASA ==========
+// ========== ENDPOINT SEND MESSAGE BIASA (tetap dipertahankan) ==========
 export const sendMessage = async (req, res) => {
   try {
     const { number, message } = req.body;
@@ -124,7 +167,6 @@ export const sendMessage = async (req, res) => {
       });
     }
 
-    // Cek koneksi WhatsApp dengan pesan maintenance
     if (!checkWaConnection(res)) return;
 
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
