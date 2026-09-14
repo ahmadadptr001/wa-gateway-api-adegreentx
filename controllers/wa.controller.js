@@ -49,34 +49,42 @@ const checkWaConnection = (res) => {
 
 // ========== FORMAT PESAN OTP ==========
 const formatOtpMessage = (otpCode) => {
-  return `🔐 *KODE OTP ANDA: ${otpCode}*
-
-Halo, permintaan verifikasi dari *Ade Green TX* sedang diproses.
+  return `🔐 *${otpCode}* adalah kode otp Anda
 
 ⚠️ *JANGAN BERIKAN KODE INI KEPADA SIAPA PUN*, termasuk yang mengaku sebagai petugas Ade Green TX.
 
-Kode ini hanya untuk verifikasi login / reset password Anda.
-
 Abaikan pesan ini jika Anda tidak merasa melakukan permintaan.
 
-✅ *Ade Green TX* – Jaga kerahasiaan akun Anda.`;
+> *Ade Green TX* – Jaga kerahasiaan akun Anda.`;
 };
 
-// ========== KIRIM GAMBAR OTP (jika ada) ==========
-const sendOtpImage = async (jid) => {
-  const imagePath = path.join(
-    process.cwd(),
-    "public",
-    "images",
-    "otp-banner.png",
+// ========== CACHE GAMBAR OTP (dibaca sekali saat startup, bukan tiap request) ==========
+let otpImageBuffer = null;
+try {
+  otpImageBuffer = await fs.readFile(
+    path.join(process.cwd(), "public", "images", "otp-banner.png"),
   );
+  console.log("✅ Banner OTP dimuat ke cache");
+} catch {
+  console.log("⚠️ Gambar OTP tidak ditemukan, OTP akan dikirim tanpa gambar");
+}
+
+// ========== KIRIM PESAN DENGAN TIMEOUT ==========
+// Jika koneksi setengah mati, sendMessage bisa hang lama dan menahan request HTTP.
+const sendMessageWithTimeout = async (jid, content, timeoutMs = 20000) => {
+  let timer;
   try {
-    await fs.access(imagePath);
-    const imageBuffer = await fs.readFile(imagePath);
-    await global.sock.sendMessage(jid, { image: imageBuffer, caption: " " });
-    console.log("✅ Gambar OTP terkirim");
-  } catch (err) {
-    console.log("⚠️ Gambar OTP tidak ditemukan, lanjut tanpa gambar");
+    return await Promise.race([
+      global.sock.sendMessage(jid, content),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Timeout: pesan gagal terkirim")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 };
 
@@ -136,19 +144,25 @@ export const sendOtp = async (req, res) => {
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
     const otpCode = message; // asumsi message adalah kode OTP
 
-    // Kirim teks OTP (kode di awal)
     const formattedText = formatOtpMessage(otpCode);
-    await global.sock.sendMessage(jid, { text: formattedText });
 
-    // Kirim gambar pendukung (jika ada)
-    await sendOtpImage(jid);
+    // Kirim sebagai SATU pesan (gambar + caption) — jauh lebih cepat
+    // daripada 2 pesan terpisah (gambar dulu, lalu teks)
+    if (otpImageBuffer) {
+      await sendMessageWithTimeout(jid, {
+        image: otpImageBuffer,
+        caption: formattedText,
+      });
+    } else {
+      await sendMessageWithTimeout(jid, { text: formattedText });
+    }
 
     res.status(200).json({
       success: true,
       message: "Kode OTP berhasil dikirim",
     });
   } catch (error) {
-    console.error("Gagal mengirim OTP:", error);
+    console.error("Gagal mengirim OTP:", error.message);
     res.status(500).json({
       success: false,
       message: "Gagal mengirim OTP",
@@ -170,7 +184,7 @@ export const sendMessage = async (req, res) => {
     if (!checkWaConnection(res)) return;
 
     const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-    await global.sock.sendMessage(jid, { text: message });
+    await sendMessageWithTimeout(jid, { text: message });
     res.status(200).json({ success: true, message: "Message sent" });
   } catch (error) {
     console.error("Send error:", error);
@@ -243,6 +257,13 @@ export const checkRegistered = async (req, res) => {
 // ========== LOGOUT ==========
 export const logout = async (req, res) => {
   try {
+    // Matikan socket dengan benar agar tidak menyisa koneksi ghost
+    if (global.sock) {
+      try {
+        global.sock.ev.removeAllListeners();
+        global.sock.end(undefined);
+      } catch {}
+    }
     global.sock = null;
     global.isConnected = false;
     pairingInProgress = false;

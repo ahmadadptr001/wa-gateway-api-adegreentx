@@ -20,8 +20,22 @@ let isStarting = false;
 let currentPhone = null;
 let currentCustomCode = null;
 let isPairingMode = false;
+let activeSocket = null; // socket yang sedang hidup, agar bisa dimatikan saat pairing baru
+let reconnectAttempt = 0;
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Matikan socket lama + lepaskan listener supaya tidak ada 2 koneksi
+// bersaing untuk 1 akun (menyebabkan pesan tertahan di HP & gateway)
+const killActiveSocket = () => {
+  if (!activeSocket) return;
+  try {
+    activeSocket.ev.removeAllListeners("connection.update");
+    activeSocket.ev.removeAllListeners("creds.update");
+    activeSocket.end(undefined);
+  } catch {}
+  activeSocket = null;
+};
 
 export async function startWhatsApp(
   phoneNumber,
@@ -38,17 +52,30 @@ export async function startWhatsApp(
   currentCustomCode = customCode;
   isPairingMode = pairingMode;
 
+  // Pastikan socket sebelumnya benar-benar mati sebelum membuat koneksi baru
+  killActiveSocket();
+
   try {
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
     const { version, isLatest } = await fetchLatestBaileysVersion();
     console.log(`📱 WA version: ${version.join(".")} (latest: ${isLatest})`);
 
     const sock = makeWASocket({
-      logger: P({ level: "info" }),
+      // Level "warn": level "info" terlalu verbose & membebani event loop
+      logger: P({ level: "warn" }),
       version,
       auth: state,
       browser: ["Ubuntu", "Chrome", "20.0.0"],
+      // 🔑 Kunci anti-lag:
+      // Jangan tandai akun "online" dari gateway — jika true, presence bentrok
+      // dengan aplikasi HP dan pesan dari HP sering tertahan (centang satu).
+      markOnlineOnConnect: false,
+      // Jangan sinkron seluruh riwayat chat saat pertama tertaut —
+      // proses ini berat dan membuat server + HP lemot.
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
     });
+    activeSocket = sock;
 
     sock.ev.on("creds.update", saveCreds);
 
@@ -65,7 +92,7 @@ export async function startWhatsApp(
         global.isConnected = true;
         await saveSession(currentPhone, currentCustomCode);
         isStarting = false;
-        currentRetryCount = 0;
+        reconnectAttempt = 0;
         isPairingMode = false;
         return;
       }
@@ -74,23 +101,22 @@ export async function startWhatsApp(
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`❌ Koneksi tertutup. Kode: ${statusCode}`);
 
-        global.isConnected = false;
-        global.sock = null;
-
-        // 🔥 Tangani restartRequired (515) - bukan error, restart koneksi tanpa pairing
-        if (statusCode === DisconnectReason.restartRequired) {
-          console.log(
-            "🔄 WhatsApp meminta restart (515), memulai ulang koneksi...",
-          );
-          isStarting = false;
-          startWhatsApp(
-            currentPhone,
-            currentCustomCode,
-            false,
-            retryCount + 1,
-          ).catch(console.error);
-          return;
+        // Lepaskan listener socket ini agar handler lama tidak ikut
+        // menimpa global.sock milik koneksi yang baru
+        try {
+          sock.ev.removeAllListeners("connection.update");
+          sock.ev.removeAllListeners("creds.update");
+        } catch {}
+        if (global.sock === sock) {
+          global.isConnected = false;
+          global.sock = null;
         }
+        if (activeSocket === sock) activeSocket = null;
+
+        // 🔑 Bebaskan guard DI SINI. Jika koneksi close sebelum pernah
+        // "open", isStarting masih true dan reconnect berikutnya akan
+        // diabaikan → server stuck 503 selamanya.
+        isStarting = false;
 
         if (statusCode === DisconnectReason.loggedOut) {
           console.log("🚫 Logged out, hapus data auth.");
@@ -98,20 +124,23 @@ export async function startWhatsApp(
             () => {},
           );
           await clearSession();
-          isStarting = false;
           return;
         }
 
-        // Reconnect biasa untuk error lain
-        console.log("🔄 Mencoba menyambung ulang dalam 5 detik...");
+        if (statusCode === DisconnectReason.restartRequired) {
+          console.log("🔄 WhatsApp meminta restart (515), menyambung ulang...");
+        }
+
+        // Reconnect dengan backoff eksponensial: 5s, 10s, 20s, 40s, maks 60s.
+        // Reconnect terlalu cepat/berulang bisa memicu rate-limit WhatsApp.
+        const delay = Math.min(5000 * 2 ** reconnectAttempt, 60000);
+        reconnectAttempt++;
+        console.log(`🔄 Menyambung ulang dalam ${delay / 1000} detik...`);
         setTimeout(() => {
-          startWhatsApp(
-            currentPhone,
-            currentCustomCode,
-            false,
-            retryCount + 1,
-          ).catch(console.error);
-        }, 5000);
+          startWhatsApp(currentPhone, currentCustomCode, false).catch(
+            console.error,
+          );
+        }, delay);
       }
     });
 
